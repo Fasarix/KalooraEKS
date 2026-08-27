@@ -1,0 +1,193 @@
+# ── Default Deny All ──────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: kaloora
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+
+---
+# ── User Service ─────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: user-service-policy
+  namespace: kaloora
+spec:
+  podSelector:
+    matchLabels:
+      app: user-service
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+        - namespaceSelector:
+            matchLabels:
+              name: ingress-nginx
+      ports:
+        - port: 5001
+          protocol: TCP
+  egress:
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - port: 53
+          protocol: UDP # CoreDNS in kube-system
+        - port: 53
+          protocol: TCP
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - port: 5432
+          protocol: TCP # PostgreSQL RDS
+        - port: 443
+          protocol: TCP # AWS APIs / HTTPS
+        - port: 80
+          protocol: TCP # EC2 Instance Metadata Service (IMDS)
+
+---
+# ── Diary Service ────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: diary-service-policy
+  namespace: kaloora
+spec:
+  podSelector:
+    matchLabels:
+      app: diary-service
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: analytics-service
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+        - namespaceSelector:
+            matchLabels:
+              name: ingress-nginx
+      ports:
+        - port: 5002
+          protocol: TCP
+  egress:
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - port: 53
+          protocol: UDP # CoreDNS in kube-system
+        - port: 53
+          protocol: TCP
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - port: 443
+          protocol: TCP # AWS DynamoDB / SQS (HTTPS)
+        - port: 80
+          protocol: TCP # EC2 Instance Metadata Service (IMDS)
+        - port: 6379
+          protocol: TCP # ElastiCache Redis Cache
+
+---
+# ── Analytics Service ────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: analytics-service-policy
+  namespace: kaloora
+spec:
+  podSelector:
+    matchLabels:
+      app: analytics-service
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+        - namespaceSelector:
+            matchLabels:
+              name: ingress-nginx
+      ports:
+        - port: 5003
+          protocol: TCP
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: diary-service
+      ports:
+        - port: 5002
+          protocol: TCP # Chiamata HTTP interna al diary-service
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - port: 53
+          protocol: UDP # CoreDNS in kube-system
+        - port: 53
+          protocol: TCP
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - port: 6379
+          protocol: TCP # ElastiCache Redis
+        - port: 443
+          protocol: TCP # AWS SQS (HTTPS)
+        - port: 80
+          protocol: TCP # EC2 Instance Metadata Service (IMDS)
+
+---
+# ── ECR Token Renewer CronJob ────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ecr-token-renewer-policy
+  namespace: kaloora
+spec:
+  podSelector:
+    matchLabels:
+      app: ecr-token-renewer
+  policyTypes:
+    - Egress
+  egress:
+    # CoreDNS resolution
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # AWS APIs (ECR, STS on 443) & Kubernetes API Server (443 / 6443)
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - port: 443
+          protocol: TCP
+        - port: 6443
+          protocol: TCP
+    # EC2 Instance Metadata Service (IMDSv2) per token IAM
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - port: 80
+          protocol: TCP
+
