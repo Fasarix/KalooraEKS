@@ -1,130 +1,207 @@
-# Guida Operativa Passo-Passo: KalooraEKS (Managed Kubernetes Cluster con AWS EKS)
+# 🥗 Kaloora — Cloud-Native Nutrition & Fitness Tracker su AWS EKS
 
-## 1. Obiettivo dell'Infrastruttura
-Questa guida descrive la procedura operativa per effettuare il provisioning completo, la configurazione e il rilascio dell'applicazione Kaloora sull'infrastruttura **`KalooraEKS`**.
-In questa variante, il Control Plane di Kubernetes è interamente gestito da AWS tramite **Amazon Elastic Kubernetes Service (EKS)** con alta disponibilità multi-AZ garantita, nodi di calcolo in Managed Node Groups, networking pod nativo via AWS VPC CNI e federazione delle identità IAM tramite IRSA (IAM Roles for Service Accounts).
+**Kaloora** è una piattaforma web distribuita per il tracciamento calorico, nutrizionale e delle attività fisiche. L'architettura è interamente distribuita e ottimizzata per **Amazon Elastic Kubernetes Service (AWS EKS)** seguendo i moderni paradigmi di **Microservizi Disaccoppiati**, **Event-Driven Architecture (EDA)**, **Managed/Serverless Services**, **Infrastructure as Code (Terraform)** e **DevSecOps (CI/CD)**.
 
 ---
 
-## 2. Prerequisiti di Sistema
-Prima di avviare il deployment, verificare la presenza dei seguenti requisiti sulla macchina locale:
+## 📸 Schemi Architetturali
 
-1. **AWS CLI v2**: configurata con permessi amministrativi per la creazione di cluster EKS, ruoli IAM, VPC e risorse correlate:
-   ```bash
-   aws configure
-   ```
-2. **Terraform** ($\ge 1.5.0$): per il provisioning dell'infrastruttura EKS e dei servizi collegati.
-3. **kubectl** ($\ge 1.30$): per l'interazione con il cluster Kubernetes.
-4. **Docker**: attivo localmente per la compilazione e il push delle immagini su Amazon ECR.
+```
+[ Utente / Browser ]
+        │
+        ▼
+[ Amazon CloudFront CDN ] (PriceClass_100, OAC, Security Headers)
+   ├── /*         ──► [ Amazon S3 Bucket ] (Frontend SPA Statico: HTML5/CSS3/Vanilla JS)
+   └── /api/*     ──► [ AWS Application Load Balancer (ALB) ]
+                            │ (Port 80 -> NodePort 30080)
+                            ▼
+            [ Amazon EKS Managed Cluster (Control Plane Multi-AZ SLA 99.95%) ]
+            ┌─────────────────────────────────────────────────────────┐
+            │  • EKS Managed Node Group (Auto-Scaling AL2023 Workers) │
+            │  • Ingress Nginx Controller (NodePort: 30080)           │
+            │  • User Service (Node.js/Express, 2 Repliche, HPA)      │
+            │  • Diary Service (Python/Flask/Gunicorn, 2 Repliche, HPA)│
+            │  • Analytics Service (Node.js/Express, 2 Repliche, HPA) │
+            │  • AWS VPC CNI (IP nativi VPC assegnati ai Pod)         │
+            └─────────────────────────────────────────────────────────┘
+                    │                │                     │
+                    ▼                ▼                     ▼
+             [ Amazon RDS ]   [ Amazon DynamoDB ]   [ Amazon SQS + DLQ ]
+             (PostgreSQL 15)  (Pay-Per-Request)      (Event-Driven Bus)
+             (Encrypted gp3)  (Diari & Alimenti)           │
+                                                           ▼
+                                                 [ Amazon ElastiCache ]
+                                                 (Redis 7 In-Memory Cache)
+```
 
 ---
 
-## 3. Fase 1: Provisioning del Cluster EKS con Terraform
+## 🏛️ Architettura dei Componenti & Servizi AWS
 
-1. Entrare nella cartella Terraform del repository `KalooraEKS`:
-   ```bash
-   cd KalooraEKS/terraform
-   ```
+| Modulo / Servizio | Tecnologia | Servizio AWS / Hosting | Responsabilità & Dettagli |
+| :--- | :--- | :--- | :--- |
+| **Frontend SPA** | HTML5, CSS3 Glassmorphism, JS ES6+ | **Amazon S3 + CloudFront CDN** | Hosting statico privato con OAC, fallback SPA su `/index.html`, HTTP Security Headers, caching edge a bassa latenza. |
+| **Reverse Proxy / Gateway** | AWS ALB + Ingress Nginx | **Application Load Balancer** | Instradamento centralizzato del traffico `/api/*` verso il target group dei worker EKS sulla NodePort `30080`. |
+| **Kubernetes Control Plane** | Kubernetes v1.36 | **Amazon EKS Managed Control Plane** | Control Plane gestito da AWS con SLA 99.95% Multi-AZ, backup automatici di etcd e patching senza disservizi. |
+| **Kubernetes Data Plane** | AL2023 / containerd | **EKS Managed Node Groups** | Nodi worker gestiti con Auto Scaling Group integrato nell'ALB, aggiornamenti controllati e IAM least privilege. |
+| **User Service** | Node.js 20, Express, pg | **Amazon EKS + Amazon RDS** | Autenticazione JWT, profilo utente, calcolo BMR/TDEE con formula Mifflin-St Jeor; persistenza su **PostgreSQL 15 (RDS)** con encryption at-rest (KMS) e in-transit forzata (`rds.force_ssl=1`). |
+| **Diary Service** | Python 3.11, Flask, boto3 | **Amazon EKS + Amazon DynamoDB** | Gestione diario giornaliero, pasti, idratazione, ricette e alimenti con validazione input; persistenza NoSQL su **DynamoDB** (Pay-Per-Request + PITR) e pubblicazione eventi su **Amazon SQS**. |
+| **Analytics Service** | Node.js 20, Express, @aws-sdk | **Amazon EKS + ElastiCache** | Consumer SQS con long polling ed exponential backoff, calcolo trend nutrizionali settimanali/mensili e caching protetto su **ElastiCache Redis 7 Replication Group** (TLS in-transit + KMS at-rest). |
+| **Event Bus & DLQ** | AWS SQS | **Amazon SQS + Dead Letter Queue** | Disaccoppiamento asincrono affidabile degli eventi applicativi con crittografia at-rest gestita (SSE-SQS). |
+| **Secrets & Config** | SSM Parameter Store | **AWS Systems Manager** | Archiviazione cifrata dei segreti applicativi (`SecureString`) e generazione dinamica del secret K8s. |
+| **Container Registry** | Docker Multi-Stage | **Amazon ECR** | Repository con scansione automatica delle vulnerabilità e **Lifecycle Policy** (conservazione max 10 immagini / scadenza untagged). |
+| **Monitoring & Alarms** | CloudWatch Metrics | **Amazon CloudWatch** | Monitoraggio proattivo e allarmi su CPU EKS Node Group, metriche RDS e codici 5XX sull'ALB. |
 
-2. Inizializzare Terraform:
+---
+
+## 📂 Struttura del Repository
+
+```
+KalooraEKS/
+├── .github/workflows/        # Pipeline CI/CD GitHub Actions (DevSecOps + Build + Deploy su EKS)
+│   └── deploy.yml            # Workflow con scansioni SAST (Gitleaks, Semgrep, Checkov)
+├── docs/                     # Documentazione tecnica
+│   ├── eks_vs_ec2_comparison.md # Analisi comparativa EKS vs EC2 Self-Managed
+│   └── openapi.yaml          # Specifica OpenAPI 3.0 dei microservizi REST
+├── frontend/                 # Single Page Application Frontend
+│   ├── css/                  # Design System Glassmorphism e Dark Mode
+│   ├── js/                   # Logica applicativa, client API, routing
+│   └── index.html            # Entrypoint WebApp
+├── k8s/                      # Manifesti Kubernetes Cloud-Native
+│   ├── namespace.yaml        # Namespace 'kaloora', LimitRange e ResourceQuota
+│   ├── secret.yaml.example   # Template dei segreti di connessione
+│   ├── ecr-cronjob.yaml      # CronJob di rinnovo automatico del token ECR (ogni 6 ore)
+│   ├── ingress-nginx.yaml    # Ingress Nginx Controller v1.10.0 con NodePort 30080 dichiarativo
+│   ├── network-policy.yaml   # Politiche di isolamento della rete
+│   ├── user-service.yaml     # Deployment & Service (NodePort/ClusterIP)
+│   ├── diary-service.yaml    # Deployment & Service (NodePort/ClusterIP)
+│   ├── analytics-service.yaml# Deployment & Service (NodePort/ClusterIP)
+│   ├── hpa-pdb.yaml          # Horizontal Pod Autoscaler & PodDisruptionBudget
+│   └── ingress.yaml          # Regole di routing Ingress Nginx per l'ALB
+├── services/                 # Microservizi Backend
+│   ├── analytics-service/    # Analytics & SQS Consumer (Node.js/Express)
+│   ├── diary-service/        # Diario, Ricette con GSI/Redis & DynamoDB/SQS (Python/Flask)
+│   └── user-service/         # Autenticazione & RDS PostgreSQL (Node.js/Express)
+├── terraform/                # Infrastruttura come Codice (AWS Provider)
+│   ├── main.tf               # Providers, Data sources e Local State (Test Environment)
+│   ├── vpc.tf                # VPC, Subnet pubbliche e private (Multi-AZ) con tag EKS e Gateway Endpoints
+│   ├── security_groups.tf    # Security Groups con regole restrittive (EKS, ALB, Nodi, RDS, Redis)
+│   ├── eks.tf                # EKS Cluster, Managed Node Groups, EKS Addons, OIDC Provider
+│   ├── iam.tf                # IAM Roles per EKS Cluster e Node Group (Least Privilege)
+│   ├── load_balancer.tf      # Application Load Balancer & Target Group (NodePort 30080)
+│   ├── managed_services.tf   # RDS Postgres, DynamoDB (con GSI), SQS, ElastiCache, ECR, SSM
+│   ├── frontend_cdn.tf       # Bucket S3, CloudFront OAC e Security Headers
+│   ├── cloudwatch.tf         # Allarmi CloudWatch per EKS Node Group, RDS e ALB
+│   ├── variables.tf          # Parametrizzazione ambiente e credenziali
+│   ├── outputs.tf            # Endpoint EKS, comandi kubectl, URI e credenziali
+│   └── terraform.tfvars      # Variabili di configurazione
+├── deploy-aws.sh             # Script di deploy applicativo end-to-end su AWS EKS
+├── LICENSE                   # Licenza MIT
+└── README.md                 # Documentazione del progetto
+```
+
+---
+
+## 🛠️ Prerequisiti
+
+- **AWS CLI v2** configurata con credenziali dotate di permessi IAM adeguati (`aws configure`).
+- **Terraform** (>= 1.5.0).
+- **kubectl** (>= 1.28).
+- **Docker** installato localmente per la compilazione delle immagini container (opzionale se delegate alla CI/CD).
+
+---
+
+## 🚀 Guida al Deployment su AWS (IaC & Automazione)
+
+Il deployment dell'infrastruttura e dei microservizi si articola in **2 fasi automatizzate**:
+
+```
+┌─────────────────────────┐              ┌─────────────────────────┐
+│      1. TERRAFORM       │ ───────────► │      2. DEPLOY-AWS      │
+│ (Provisioning EKS &     │              │ (Deploy Frontend, ECR & │
+│  Managed Services AWS)  │              │  Microservizi via K8s)  │
+└─────────────────────────┘              └─────────────────────────┘
+```
+
+---
+
+### Passo 1: Provisioning dell'Infrastruttura con Terraform
+
+1. Spostati nella cartella `terraform/`:
    ```bash
+   cd terraform
    terraform init
    ```
 
-3. Eseguire l'applicazione del piano di provisioning:
+2. Esegui il deployment delle risorse su AWS:
    ```bash
    terraform apply -auto-approve
    ```
 
-   **Cosa fa questa fase:**
-   - Crea la VPC con subnet pubbliche e private distribuite su due Availability Zone.
-   - Crea il cluster **Amazon EKS** con endpoint sia pubblici che privati abilitati.
-   - Configura il provider OpenID Connect (OIDC) per abilitare le policy IRSA.
-   - Crea l'**EKS Managed Node Group** (2 istanze worker distribuite nelle AZ, con Launch Template e conformità IMDSv2).
-   - Crea l'Application Load Balancer (ALB) e associa dinamicamente l'Auto Scaling Group dei nodi EKS al Target Group dell'ALB.
-   - Istanzia i servizi gestiti AWS (RDS PostgreSQL, DynamoDB On-Demand, SQS + DLQ, ElastiCache).
-   - Crea il bucket S3 e la distribuzione CloudFront con Origin Access Control (OAC) e header `X-Origin-Verify`.
-   - Genera i repository Amazon ECR per ciascun microservizio.
+*Terraform creerà la VPC, le subnet Multi-AZ con tag EKS, i Security Group, il Control Plane Amazon EKS, l'EKS Managed Node Group per i Worker, i ruoli IAM, l'ALB, RDS PostgreSQL cifrato, DynamoDB on-demand, SQS con DLQ, ElastiCache Redis, S3, CloudFront OAC e genererà automaticamente `k8s/secret.yaml`.*
 
 ---
 
-## 4. Fase 2: Configurazione di kubectl per il Cluster EKS
+### Passo 2: Deployment dei Microservizi e Frontend (`deploy-aws.sh`)
 
-Al termine del comando `terraform apply`, è necessario aggiornare il file di configurazione `~/.kube/config` locale per consentire a `kubectl` di autenticarsi sul cluster EKS:
+Dalla radice del progetto, esegui lo script orchestratore:
 
-1. Eseguire il comando AWS CLI per aggiornare la configurazione:
-   ```bash
-   aws eks update-kubeconfig --region us-east-1 --name kaloora-eks-cluster
-   ```
+```bash
+./deploy-aws.sh
+```
 
-2. Verificare che il cluster risponda e che i nodi worker siano visibili:
-   ```bash
-   kubectl get nodes
-   ```
-   *(I nodi passeranno allo stato `Ready` entro 1-2 minuti dall'avvio del cluster).*
+#### Fasi eseguite dallo script:
+1. **Recupero Parametri**: Estrae gli output da Terraform (Nome cluster EKS, Bucket S3, CloudFront URL/DistID, URI ECR).
+2. **Configurazione `kubectl`**: Aggiorna il kubeconfig locale (`aws eks update-kubeconfig --region $AWS_REGION --name $CLUSTER_NAME`).
+3. **Deploy Frontend**: Sincronizza i file statici su S3 e richiede l'invalidazione della cache CloudFront.
+4. **Build & Push ECR**: Compila e carica le immagini Docker su Amazon ECR.
+5. **Deploy K8s**: Applica direttamente al cluster EKS Namespace, Secrets, NetworkPolicies, Ingress Nginx (su NodePort `30080`), User Service, Diary Service, Analytics Service, regole HPA/PDB e popola il database DynamoDB.
 
----
-
-## 5. Fase 3: Deployment dei Microservizi e Frontend
-
-1. Tornare nella cartella principale di `KalooraEKS`:
-   ```bash
-   cd ..
-   ```
-
-2. Eseguire lo script di deployment:
-   ```bash
-   ./deploy-aws.sh
-   ```
-
-   **Sequenza di operazioni eseguite dallo script:**
-   1. **Estrazione Parametri**: Recupera automaticamente il nome del cluster, la regione, i bucket S3 e gli URL dei registri ECR da Terraform.
-   2. **Configurazione kubectl**: Riconferma l'aggancio a EKS tramite `aws eks update-kubeconfig`.
-   3. **Deploy Frontend su S3 & CloudFront**: Sincronizza i file statici sul bucket S3 e richiede l'invalidazione della cache globale della CDN.
-   4. **Build & Push Immagini Docker**: Compila le immagini per piattaforma `linux/amd64`, effettua il login al registry ECR ed esegue il push di `user-service`, `diary-service` e `analytics-service`.
-   5. **Applicazione Manifesti Kubernetes**:
-      - Attende che almeno 2 nodi worker siano in stato `Ready`.
-      - Crea il namespace `kaloora` e applica i segreti generati da Terraform.
-      - Applica il CronJob per il rinnovo periodico del token ECR.
-      - Distribuisce i microservizi con i rispettivi Service e PodDisruptionBudget.
-      - Installa il controller Ingress Nginx e configura la risorsa Ingress (in ascolto su NodePort 30080 per ricevere il traffico proveniente dall'ALB).
-      - Esegue il seeding iniziale degli alimenti e delle ricette nel database DynamoDB.
+Al termine del deployment, l'applicazione sarà accessibile all'URL pubblico di CloudFront:
+```
+👉 https://dxxxxxxxxxxxx.cloudfront.net
+```
 
 ---
 
-## 6. Fase 4: Validazione Funzionale e Test degli Endpoint
+## 🛡️ Sicurezza & Conformità DevSecOps
 
-Al termine dello script di deploy, verrà mostrato l'URL pubblico di CloudFront (es. `https://d2xxxxxxxxxxxx.cloudfront.net`).
-
-1. **Test di Connettività e Health Check:**
-   ```bash
-   curl -I https://<CLOUDFRONT_DOMAIN>/healthz
-   # Risposta attesa: HTTP/2 200 OK
-   ```
-
-2. **Accesso all'Applicazione via Browser:**
-   - Navigare all'indirizzo `https://<CLOUDFRONT_DOMAIN>`.
-   - Registrare un nuovo utente, accedere alla dashboard e inserire un pasto nel diario.
-   - Verificare che il calcolo metabolico e le aggregazioni nutrizionali vengano calcolati e aggiornati istantaneamente.
-
-3. **Verifica dello Stato dei Pod nel Cluster:**
-   ```bash
-   kubectl get pods -n kaloora -o wide
-   kubectl get ingress -n kaloora
-   ```
+- **Amazon EKS Managed Security**:
+  - Control Plane gestito da AWS con accesso API privato/pubblico e IAM Authenticator integrato.
+  - OIDC Provider configurato per abilitare IAM Roles for Service Accounts (IRSA).
+  - Managed Node Group su AMI Amazon Linux 2023 con patching di sicurezza gestito da AWS.
+- **Crittografia Completa (At-Rest & In-Transit)**:
+  - **RDS PostgreSQL**: Storage cifrato via AWS KMS (`gp3 20GB`), in-transit forzato tramite Parameter Group (`rds.force_ssl = 1`) e connessione pool `pg` con SSL/TLS.
+  - **ElastiCache Redis**: Gestito tramite Replication Group con crittografia at-rest KMS, crittografia in-transit (TLSv1.2), autenticazione Redis AUTH (`auth_token`) e connessioni Node.js con `socket: { tls: true }`.
+  - **Amazon S3**: Crittografia server-side SSE-S3 (`AES256`), blocco accessi pubblici, policy che nega richieste non-HTTPS (`aws:SecureTransport: "false"`) e accesso riservato a CloudFront OAC con SigV4.
+  - **Amazon SQS + DLQ**: Crittografia at-rest abilitata (SSE-SQS) e trasporto su HTTPS.
+  - **Amazon EBS**: Crittografia abilitata su tutti i volumi dei nodi EKS.
+  - **CloudFront CDN**: Forzatura HTTPS (`redirect-to-https`) su tutti i path, policy Security Headers completa (CSP, HSTS, X-Frame-Options DENY, X-Content-Type-Options nosniff) e header di verifica `X-Origin-Verify` verso l'ALB.
+- **Isolamento di Rete & VPC Endpoints**:
+  - RDS ed ElastiCache risiedono in Subnet Private Multi-AZ non accessibili da Internet.
+  - **Gateway VPC Endpoints** per S3 e DynamoDB per instradamento interno a costo zero.
+  - Security Group EKS: porte NodePort `30000-32767` accessibili unicamente dall'ALB Security Group.
+- **Hardening dei Container**:
+  - Container eseguiti come utente non-root (`UID/GID 10001`).
+  - `readOnlyRootFilesystem: true`, `allowPrivilegeEscalation: false` e drop di tutte le Linux capabilities (`drop: ALL`).
+- **Pipeline CI/CD DevSecOps**:
+  - Scansione secret con **Gitleaks** (bloccante).
+  - Scansione statica del codice (SAST) con **Semgrep**.
+  - Scansione IaC di Terraform e manifesti Kubernetes con **Checkov**.
 
 ---
 
-## 7. Fase 5: Procedura di Teardown Completo
+## 🧹 Teardown dell'Infrastruttura
 
-Per disallocare tutte le risorse ed eliminare qualsiasi costo di mantenimento del cluster EKS e dei servizi gestiti:
+Per distruggere tutte le risorse allocate su AWS ed azzerare i costi:
 
-1. Posizionarsi nella cartella Terraform:
-   ```bash
-   cd KalooraEKS/terraform
-   ```
+```bash
+cd terraform
+terraform destroy -auto-approve
+```
 
-2. Eseguire la distruzione automatizzata:
-   ```bash
-   terraform destroy -auto-approve
-   ```
+---
+
+## 📄 Licenza
+
+Questo progetto è distribuito sotto licenza **MIT**. Consulta il file [LICENSE](LICENSE) per ulteriori dettagli.

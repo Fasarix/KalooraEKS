@@ -1,0 +1,218 @@
+name: Kaloora EKS Cloud CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: us-east-1
+  PROJECT_NAME: kaloora-eks
+
+jobs:
+  # ── FASE 1: DevSecOps Scans (Checkov, Gitleaks, Semgrep) ─────────────────────
+  security-scans:
+    name: Security & SAST Scans
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Gitleaks Secret Detection
+        uses: gitleaks/gitleaks-action@v2
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Semgrep SAST Scan (Node.js & Python)
+        continue-on-error: true
+        run: |
+          python3 -m pip install --break-system-packages semgrep || pip install semgrep || true
+          semgrep scan --config auto --error services/ || true
+
+      - name: Checkov IaC Scan (K8s & Terraform)
+        continue-on-error: true
+        run: |
+          pip install --break-system-packages checkov || pip install checkov || true
+          checkov -d k8s/ --framework kubernetes --soft-fail || true
+          checkov -d terraform/ --framework terraform --soft-fail || true
+
+  # ── FASE 2: Build & Push Immagini Docker su ECR ──────────────────────────────
+  build-and-push:
+    name: Build & Push Container Images to ECR
+    needs: security-scans
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & Push Microservizi (linux/amd64)
+        id: build-images
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          for SERVICE in user-service diary-service analytics-service; do
+            echo "--> Building & pushing ${SERVICE} for linux/amd64..."
+            docker buildx build --platform linux/amd64 \
+              -t $REGISTRY/${{ env.PROJECT_NAME }}/${SERVICE}:${IMAGE_TAG} \
+              -t $REGISTRY/${{ env.PROJECT_NAME }}/${SERVICE}:v1.0.0 \
+              --push services/${SERVICE}
+          done
+
+  # ── FASE 3: Deploy Frontend su S3 & Invalidate CloudFront ────────────────────
+  deploy-frontend:
+    name: Deploy Frontend to S3 & CloudFront
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Sync Static Files to S3
+        env:
+          S3_BUCKET: ${{ secrets.S3_FRONTEND_BUCKET }}
+        run: |
+          if [ -z "$S3_BUCKET" ]; then
+            S3_BUCKET=$(aws s3api list-buckets --query "Buckets[?starts_with(Name, '${{ env.PROJECT_NAME }}-frontend')].Name" --output text | awk '{print $1}')
+          fi
+          if [ -z "$S3_BUCKET" ]; then
+            echo "❌ S3_FRONTEND_BUCKET non trovato su AWS."
+            exit 1
+          fi
+          echo "Sincronizzazione su s3://${S3_BUCKET}..."
+          aws s3 sync frontend/ s3://${S3_BUCKET}/ --exclude "Dockerfile" --exclude "nginx.conf" --delete
+
+      - name: Invalidate CloudFront Cache
+        env:
+          CLOUDFRONT_DIST_ID: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}
+        run: |
+          if [ -z "$CLOUDFRONT_DIST_ID" ]; then
+            CLOUDFRONT_DIST_ID=$(aws cloudfront list-distributions --query "DistributionList.Items[?contains(Origins.Items[0].Id, '${{ env.PROJECT_NAME }}') || contains(Comment, '${{ env.PROJECT_NAME }}')].Id" --output text | awk '{print $1}')
+          fi
+          if [ -n "$CLOUDFRONT_DIST_ID" ] && [ "$CLOUDFRONT_DIST_ID" != "None" ]; then
+            echo "Invalidazione CloudFront ${CLOUDFRONT_DIST_ID}..."
+            aws cloudfront create-invalidation --distribution-id "$CLOUDFRONT_DIST_ID" --paths "/*" || true
+          fi
+
+  # ── FASE 4: Deploy Kubernetes Manifests direttamente su EKS ──────────────────
+  deploy-k8s:
+    name: Deploy Microservices to Amazon EKS Cluster
+    needs: [build-and-push, deploy-frontend]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.36.0'
+
+      - name: Update Kubeconfig for Amazon EKS
+        run: |
+          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.PROJECT_NAME }}-cluster
+
+      - name: Deploy Kubernetes Resources
+        run: |
+          echo "1. Estrazione parametri da AWS SSM Parameter Store ed ECR..."
+          ACCOUNT_ID=$(aws sts get-caller-identity --query "Account" --output text)
+          ECR_REGISTRY="${ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
+          ECR_PASS=$(aws ecr get-login-password --region ${{ env.AWS_REGION }})
+          JWT_SEC=$(aws ssm get-parameter --name "/${{ env.PROJECT_NAME }}/jwt_secret" --with-decryption --query "Parameter.Value" --output text 2>/dev/null || echo "")
+          DB_P=$(aws ssm get-parameter --name "/${{ env.PROJECT_NAME }}/db_password" --with-decryption --query "Parameter.Value" --output text 2>/dev/null || echo "")
+          REDIS_TOKEN=$(aws ssm get-parameter --name "/${{ env.PROJECT_NAME }}/redis_auth_token" --with-decryption --query "Parameter.Value" --output text 2>/dev/null || echo "")
+          PG_HOST=$(aws ssm get-parameter --name "/${{ env.PROJECT_NAME }}/postgres_host" --query "Parameter.Value" --output text 2>/dev/null || echo "")
+          REDIS_HOST=$(aws ssm get-parameter --name "/${{ env.PROJECT_NAME }}/redis_host" --query "Parameter.Value" --output text 2>/dev/null || echo "")
+          SQS_URL=$(aws ssm get-parameter --name "/${{ env.PROJECT_NAME }}/sqs_queue_url" --query "Parameter.Value" --output text 2>/dev/null || echo "")
+
+          echo "2. Applicazione Namespace e Network Policies..."
+          kubectl apply -f k8s/namespace.yaml
+          kubectl apply -f k8s/network-policy.yaml
+
+          echo "3. Configurazione Secret ECR ed applicativi..."
+          kubectl create secret docker-registry ecr-secret -n kaloora \
+            --docker-server="$ECR_REGISTRY" \
+            --docker-username=AWS \
+            --docker-password="$ECR_PASS" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl patch serviceaccount default -n kaloora -p '{"imagePullSecrets": [{"name": "ecr-secret"}]}' || true
+          
+          if [ -f k8s/ecr-cronjob.yaml ]; then
+            kubectl apply -f k8s/ecr-cronjob.yaml
+          fi
+
+          kubectl create secret generic kaloora-secrets -n kaloora \
+            --from-literal=jwt-secret="$JWT_SEC" \
+            --from-literal=postgres-host="$PG_HOST" \
+            --from-literal=postgres-password="$DB_P" \
+            --from-literal=postgres-user=postgres \
+            --from-literal=postgres-db=userdb \
+            --from-literal=redis-host="$REDIS_HOST" \
+            --from-literal=redis-auth-token="$REDIS_TOKEN" \
+            --from-literal=sqs-queue-url="$SQS_URL" \
+            --from-literal=aws-region="${{ env.AWS_REGION }}" \
+            --from-literal=dynamodb-diary-table="${{ env.PROJECT_NAME }}-diary" \
+            --from-literal=dynamodb-foods-table="${{ env.PROJECT_NAME }}-foods" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          echo "4. Aggiornamento immagini container nei manifesti..."
+          sed -i "s|image: user-service:v1.0.0|image: ${ECR_REGISTRY}/${{ env.PROJECT_NAME }}/user-service:v1.0.0|g" k8s/user-service.yaml
+          sed -i "s|image: diary-service:v1.0.0|image: ${ECR_REGISTRY}/${{ env.PROJECT_NAME }}/diary-service:v1.0.0|g" k8s/diary-service.yaml
+          sed -i "s|image: analytics-service:v1.0.0|image: ${ECR_REGISTRY}/${{ env.PROJECT_NAME }}/analytics-service:v1.0.0|g" k8s/analytics-service.yaml
+
+          echo "5. Applicazione Ingress Nginx e Microservizi..."
+          kubectl apply -f k8s/ingress-nginx.yaml
+          kubectl apply -f k8s/user-service.yaml
+          kubectl apply -f k8s/diary-service.yaml
+          kubectl apply -f k8s/analytics-service.yaml
+          kubectl apply -f k8s/hpa-pdb.yaml || true
+          kubectl apply -f k8s/ingress.yaml
+
+          echo "6. Rollout restart e attesa deploy..."
+          kubectl rollout restart deployment user-service diary-service analytics-service -n kaloora || true
+          kubectl rollout status deployment diary-service -n kaloora --timeout=120s || true
+
+          echo "7. Esecuzione Recipe Seed su DynamoDB..."
+          POD=$(kubectl get pods -n kaloora -l app=diary-service -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+          if [ -n "$POD" ]; then
+            kubectl exec -n kaloora "$POD" -- env PYTHONPATH=/app python /app/seeds/recipe_seed.py || true
+          fi
+
+          echo "8. Stato finale dei Pod:"
+          kubectl get pods -n kaloora -o wide
+          kubectl get pods -n ingress-nginx
